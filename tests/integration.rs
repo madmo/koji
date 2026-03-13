@@ -1242,6 +1242,7 @@ mod jj_tests {
     }
 
     #[test]
+    #[cfg(not(target_os = "windows"))]
     fn test_colocated_config_override_to_git() -> Result<(), Box<dyn Error>> {
         let bin_path = assert_cmd::cargo::cargo_bin!("koji").to_path_buf();
         let temp_dir = tempfile::tempdir()?;
