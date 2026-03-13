@@ -1,8 +1,7 @@
 use crate::config::{CommitType, Config};
 use crate::scope::ScopeMatches;
-use anyhow::{Context, Result};
-use conventional_commit_parser::parse_summary;
-use gix::bstr::ByteSlice;
+use crate::vcs::VcsBackend;
+use anyhow::Result;
 use indexmap::IndexMap;
 use inquire::error::InquireError;
 use inquire::ui::{Attributes, Color, RenderConfig, StyleSheet};
@@ -32,6 +31,58 @@ impl PromptError {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct PreviousAnswers {
+    pub commit_type: Option<String>,
+    pub scope: Option<String>,
+    pub summary: Option<String>,
+    pub body: Option<String>,
+    pub is_breaking_change: bool,
+    pub breaking_change_text: Option<String>,
+    pub issue_footer: Option<String>,
+}
+
+impl PreviousAnswers {
+    /// Parse an existing conventional commit description into pre-populated answers.
+    ///
+    /// Returns `None` if the description cannot be parsed as a conventional commit.
+    pub fn from_description(desc: &str) -> Option<Self> {
+        let parsed = conventional_commit_parser::parse(desc).ok()?;
+
+        let breaking_pos = parsed.footers.iter().position(|f| f.is_breaking_change());
+
+        let issue_footer_entry = match breaking_pos {
+            Some(pos) if pos > 0 => Some(&parsed.footers[pos - 1]),
+            Some(_) => None,
+            None => parsed.footers.last(),
+        }
+        .filter(|f| !f.is_breaking_change());
+
+        Some(Self {
+            commit_type: Some(parsed.commit_type.as_ref().to_string()),
+            scope: parsed.scope,
+            summary: Some(parsed.summary),
+            body: parsed.body,
+            is_breaking_change: parsed.is_breaking_change,
+            breaking_change_text: parsed
+                .footers
+                .iter()
+                .find(|f| f.is_breaking_change())
+                .map(|f| f.content.clone()),
+            issue_footer: issue_footer_entry.map(|f| {
+                if matches!(
+                    f.token_separator,
+                    conventional_commit_parser::commit::Separator::Hash
+                ) {
+                    format!("{} #{}", f.token, f.content)
+                } else {
+                    format!("{}: {}", f.token, f.content)
+                }
+            }),
+        })
+    }
+}
+
 fn get_skip_hint() -> &'static str {
     "<esc> or <return> to skip"
 }
@@ -51,12 +102,10 @@ fn get_render_config() -> RenderConfig<'static> {
     }
 }
 
-/// Transform commit type choice
 fn transform_commit_type_choice(choice: &str) -> String {
     choice.split(':').next().unwrap().into()
 }
 
-/// Format the commit type choices
 fn format_commit_type_choice(
     use_emoji: bool,
     commit_type: &CommitType,
@@ -98,12 +147,22 @@ fn validate_issue_reference(input: &str) -> Result<Validation, CustomUserError> 
     }
 }
 
-fn prompt_type(config: &Config) -> Result<String> {
-    let type_values = config
+fn prompt_type(config: &Config, previous_type: Option<&str>) -> Result<String> {
+    let mut type_values: Vec<String> = config
         .commit_types
         .iter()
         .map(|(_, choice)| format_commit_type_choice(config.emoji, choice, &config.commit_types))
         .collect();
+
+    if let Some(prev) = previous_type {
+        if let Some(pos) = type_values
+            .iter()
+            .position(|v| transform_commit_type_choice(v) == prev)
+        {
+            let item = type_values.remove(pos);
+            type_values.insert(0, item);
+        }
+    }
 
     let selected_type = Select::new("What type of change are you committing?", type_values)
         .with_render_config(get_render_config())
@@ -121,38 +180,7 @@ pub struct ScopeAutocompleter {
 
 impl ScopeAutocompleter {
     fn get_existing_scopes(&self) -> Result<Vec<String>> {
-        let repo = gix::discover(&self.config.workdir).context("could not find git repository")?;
-
-        let head_id = repo.head_id().context("could not get HEAD")?;
-
-        let walk =
-            repo.rev_walk([head_id.detach()])
-                .sorting(gix::revision::walk::Sorting::ByCommitTime(
-                    gix::traverse::commit::simple::CommitTimeOrder::NewestFirst,
-                ));
-
-        let mut scopes: Vec<String> = Vec::new();
-
-        for info in walk.all()? {
-            let info = info?;
-
-            let commit = repo.find_commit(info.id)?;
-
-            let message = commit.message()?;
-
-            let summary = message.summary();
-
-            // Parse the summary - ignore errors for invalid commit messages
-            if let Ok(parsed) = parse_summary(summary.to_str()?) {
-                if let Some(scope) = parsed.scope {
-                    if !scopes.contains(&scope) {
-                        scopes.push(scope);
-                    }
-                }
-            }
-        }
-
-        Ok(scopes)
+        VcsBackend::detect_with_hint(&self.config.workdir, self.config.vcs)?.commit_scopes()
     }
 
     /// Configured scopes (formatted with descriptions) followed by any scopes
@@ -234,14 +262,22 @@ impl Config {
         matched.into_iter().chain(rest).collect()
     }
 
-    fn prompt_scope(&self, scope_matches: &ScopeMatches) -> Result<Option<String>> {
+    fn prompt_scope(
+        &self,
+        scope_matches: &ScopeMatches,
+        previous_scope: Option<&str>,
+    ) -> Result<Option<String>> {
         if self.force_config_scopes && !self.commit_scopes.is_empty() {
-            return self.prompt_scope_select(scope_matches);
+            return self.prompt_scope_select(scope_matches, previous_scope);
         }
-        self.prompt_scope_text(scope_matches)
+        self.prompt_scope_text(scope_matches, previous_scope)
     }
 
-    fn prompt_scope_select(&self, scope_matches: &ScopeMatches) -> Result<Option<String>> {
+    fn prompt_scope_select(
+        &self,
+        scope_matches: &ScopeMatches,
+        previous_scope: Option<&str>,
+    ) -> Result<Option<String>> {
         // A single unambiguous match is pre-assigned; print it so it stays visible.
         if let Some(scope) = scope_matches.suggested() {
             print_answered_scope_prompt(scope);
@@ -250,8 +286,12 @@ impl Config {
 
         // Otherwise fall back to user selection, matched scopes listed first.
         let scope_values = self.scope_values_ordered(scope_matches);
+        let starting_cursor = previous_scope
+            .and_then(|previous| scope_values.iter().position(|s| scope_name(s) == previous))
+            .unwrap_or(0);
         let prompt = Select::new("What's the scope of this change?", scope_values)
             .with_render_config(get_render_config())
+            .with_starting_cursor(starting_cursor)
             .with_formatter(&|v| scope_name(v.value).to_string());
 
         let result = if self.allow_empty_scope {
@@ -269,7 +309,11 @@ impl Config {
         Ok(result.map(|s| scope_name(&s).to_string()))
     }
 
-    fn prompt_scope_text(&self, scope_matches: &ScopeMatches) -> Result<Option<String>> {
+    fn prompt_scope_text(
+        &self,
+        scope_matches: &ScopeMatches,
+        previous_scope: Option<&str>,
+    ) -> Result<Option<String>> {
         let mut autocompleter = ScopeAutocompleter {
             config: self.clone(),
         };
@@ -300,7 +344,7 @@ impl Config {
             })
             .with_help_message(&help);
 
-        if let Some(scope) = detected {
+        if let Some(scope) = detected.or(previous_scope) {
             text = text.with_initial_value(scope);
         }
 
@@ -333,28 +377,41 @@ impl Config {
     }
 }
 
-fn prompt_summary(msg: String) -> Result<String> {
-    let previous_summary = match parse_summary(&msg) {
-        Ok(parsed) => parsed.summary,
-        Err(_) => "".into(),
-    };
-
-    let summary = Text::new("Write a short, imperative tense description of the change:")
+fn prompt_summary(previous_summary: Option<&str>) -> Result<String> {
+    let mut prompt = Text::new("Write a short, imperative tense description of the change:")
         .with_render_config(get_render_config())
-        .with_placeholder(&previous_summary)
-        .with_validator(validate_summary)
+        .with_validator(validate_summary);
+
+    if let Some(prev) = previous_summary {
+        if !prev.is_empty() {
+            prompt = prompt.with_initial_value(prev);
+        }
+    }
+
+    let summary = prompt
         .prompt()
         .map_err(|e| PromptError::from_inquire(e, "Commit summary input"))?;
 
     Ok(summary)
 }
 
-fn prompt_body() -> Result<Option<String>> {
+fn prompt_body(previous_body: Option<&str>) -> Result<Option<String>> {
     let help_message = format!("{}, {}", "Use '\\n' for newlines", get_skip_hint());
 
-    match Text::new("Provide a longer description of the change:")
+    // Pre-fill: convert real newlines back to \\n for display in the single-line input
+    let escaped_body = previous_body
+        .filter(|p| !p.is_empty())
+        .map(|p| p.replace('\n', "\\n"));
+
+    let mut prompt = Text::new("Provide a longer description of the change:")
         .with_render_config(get_render_config())
-        .with_help_message(help_message.as_str())
+        .with_help_message(help_message.as_str());
+
+    if let Some(ref escaped) = escaped_body {
+        prompt = prompt.with_initial_value(escaped);
+    }
+
+    match prompt
         .prompt_skippable()
         .map_err(|e| PromptError::from_inquire(e, "Body input"))?
     {
@@ -364,22 +421,32 @@ fn prompt_body() -> Result<Option<String>> {
     }
 }
 
-fn prompt_breaking() -> Result<bool> {
+fn prompt_breaking(previous_breaking: bool) -> Result<bool> {
     let answer = Confirm::new("Are there any breaking changes?")
         .with_render_config(get_render_config())
-        .with_default(false)
+        .with_default(previous_breaking)
         .prompt()
         .map_err(|e| PromptError::from_inquire(e, "Breaking changes prompt"))?;
 
     Ok(answer)
 }
 
-fn prompt_breaking_text() -> Result<Option<String>> {
+fn prompt_breaking_text(previous_text: Option<&str>) -> Result<Option<String>> {
     let help_message = format!("{}, {}", "Use '\\n' for newlines", get_skip_hint());
 
-    match Text::new("Describe the breaking changes in detail:")
+    let escaped_text = previous_text
+        .filter(|p| !p.is_empty())
+        .map(|p| p.replace('\n', "\\n"));
+
+    let mut prompt = Text::new("Describe the breaking changes in detail:")
         .with_render_config(get_render_config())
-        .with_help_message(help_message.as_str())
+        .with_help_message(help_message.as_str());
+
+    if let Some(ref escaped) = escaped_text {
+        prompt = prompt.with_initial_value(escaped);
+    }
+
+    match prompt
         .prompt_skippable()
         .map_err(|e| PromptError::from_inquire(e, "Breaking changes description"))?
     {
@@ -389,21 +456,29 @@ fn prompt_breaking_text() -> Result<Option<String>> {
     }
 }
 
-fn prompt_issues() -> Result<bool> {
+fn prompt_issues(has_previous_issue: bool) -> Result<bool> {
     let answer = Confirm::new("Does this change affect any open issues?")
         .with_render_config(get_render_config())
-        .with_default(false)
+        .with_default(has_previous_issue)
         .prompt()
         .map_err(|e| PromptError::from_inquire(e, "Issues prompt"))?;
 
     Ok(answer)
 }
 
-fn prompt_issue_text() -> Result<String> {
-    let summary = Text::new("Add the issue reference:")
+fn prompt_issue_text(previous_issue: Option<&str>) -> Result<String> {
+    let mut prompt = Text::new("Add the issue reference:")
         .with_render_config(get_render_config())
         .with_help_message("e.g. \"closes #123\"")
-        .with_validator(validate_issue_reference)
+        .with_validator(validate_issue_reference);
+
+    if let Some(prev) = previous_issue {
+        if !prev.is_empty() {
+            prompt = prompt.with_initial_value(prev);
+        }
+    }
+
+    let summary = prompt
         .prompt()
         .map_err(|e| PromptError::from_inquire(e, "Issue reference input"))?;
 
@@ -423,27 +498,29 @@ pub struct Answers {
 
 /// Create the interactive prompt
 pub fn create_prompt(
-    last_message: String,
+    previous: Option<PreviousAnswers>,
     config: &Config,
     scope_matches: &ScopeMatches,
 ) -> Result<Answers> {
-    let commit_type = prompt_type(config)?;
-    let scope = config.prompt_scope(scope_matches)?;
-    let summary = prompt_summary(last_message)?;
-    let body = prompt_body()?;
+    let prev = previous.unwrap_or_default();
+
+    let commit_type = prompt_type(config, prev.commit_type.as_deref())?;
+    let scope = config.prompt_scope(scope_matches, prev.scope.as_deref())?;
+    let summary = prompt_summary(prev.summary.as_deref())?;
+    let body = prompt_body(prev.body.as_deref())?;
 
     let mut breaking = false;
     let mut breaking_footer: Option<String> = None;
     if config.breaking_changes {
-        breaking = prompt_breaking()?;
+        breaking = prompt_breaking(prev.is_breaking_change)?;
         if breaking {
-            breaking_footer = prompt_breaking_text()?;
+            breaking_footer = prompt_breaking_text(prev.breaking_change_text.as_deref())?;
         }
     }
 
     let mut issue_footer = None;
-    if config.issues && prompt_issues()? {
-        issue_footer = Some(prompt_issue_text()?);
+    if config.issues && prompt_issues(prev.issue_footer.is_some())? {
+        issue_footer = Some(prompt_issue_text(prev.issue_footer.as_deref())?);
     }
 
     Ok(Answers {
@@ -562,5 +639,124 @@ mod tests {
             .eq(&Validation::Invalid(
                 "An issue reference is required".into()
             )));
+    }
+
+    #[test]
+    fn test_from_description_simple() {
+        let result = PreviousAnswers::from_description("feat: add user login");
+
+        let answers = result.expect("should parse a simple conventional commit");
+        assert_eq!(answers.commit_type, Some("feat".into()));
+        assert_eq!(answers.scope, None);
+        assert_eq!(answers.summary, Some("add user login".into()));
+        assert_eq!(answers.body, None);
+        assert!(!answers.is_breaking_change);
+        assert_eq!(answers.breaking_change_text, None);
+        assert_eq!(answers.issue_footer, None);
+    }
+
+    #[test]
+    fn test_from_description_with_scope() {
+        let result = PreviousAnswers::from_description("fix(parser): handle edge case");
+
+        let answers = result.expect("should parse commit with scope");
+        assert_eq!(answers.commit_type, Some("fix".into()));
+        assert_eq!(answers.scope, Some("parser".into()));
+        assert_eq!(answers.summary, Some("handle edge case".into()));
+    }
+
+    #[test]
+    fn test_from_description_with_body() {
+        let desc = "feat: add login\n\nThis adds a complete login flow with OAuth support.";
+        let result = PreviousAnswers::from_description(desc);
+
+        let answers = result.expect("should parse commit with body");
+        assert_eq!(answers.commit_type, Some("feat".into()));
+        assert_eq!(answers.summary, Some("add login".into()));
+        assert_eq!(
+            answers.body,
+            Some("This adds a complete login flow with OAuth support.".into())
+        );
+    }
+
+    #[test]
+    fn test_from_description_with_breaking_change_footer() {
+        let desc =
+            "feat!: remove deprecated API\n\nBREAKING CHANGE: The /v1 endpoints have been removed";
+        let result = PreviousAnswers::from_description(desc);
+
+        let answers = result.expect("should parse commit with breaking change");
+        assert!(answers.is_breaking_change);
+        assert_eq!(
+            answers.breaking_change_text,
+            Some("The /v1 endpoints have been removed".into())
+        );
+    }
+
+    #[test]
+    fn test_from_description_with_breaking_change_bang_only() {
+        let result = PreviousAnswers::from_description("feat!: remove deprecated API");
+
+        let answers = result.expect("should parse breaking change with bang");
+        assert!(answers.is_breaking_change);
+        assert_eq!(answers.breaking_change_text, None);
+    }
+
+    #[test]
+    fn test_from_description_with_issue_footer() {
+        let desc = "fix: resolve crash\n\nCloses #456";
+        let result = PreviousAnswers::from_description(desc);
+
+        let answers = result.expect("should parse commit with issue footer");
+        assert_eq!(answers.issue_footer, Some("Closes #456".into()));
+    }
+
+    #[test]
+    fn test_from_description_with_issue_and_breaking_footers() {
+        let desc = "feat!: overhaul auth\n\nRefs #789\nBREAKING CHANGE: Token format changed";
+        let result = PreviousAnswers::from_description(desc);
+
+        let answers = result.expect("should parse commit with both footers");
+        assert!(answers.is_breaking_change);
+        assert_eq!(
+            answers.breaking_change_text,
+            Some("Token format changed".into())
+        );
+        assert_eq!(answers.issue_footer, Some("Refs #789".into()));
+    }
+
+    #[test]
+    fn test_from_description_with_colon_separator_footer() {
+        let desc = "fix: resolve crash\n\nCloses: 456";
+        let result = PreviousAnswers::from_description(desc);
+
+        let answers = result.expect("should parse commit with colon-separated footer");
+        assert_eq!(answers.issue_footer, Some("Closes: 456".into()));
+    }
+
+    #[test]
+    fn test_from_description_invalid_message() {
+        let result = PreviousAnswers::from_description("not a conventional commit");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_from_description_empty_string() {
+        let result = PreviousAnswers::from_description("");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_from_description_breaking_footer_only_no_issue() {
+        let desc = "feat!: drop support\n\nBREAKING CHANGE: Removed Python 2 support";
+        let result = PreviousAnswers::from_description(desc);
+
+        let answers = result.expect("should parse breaking-only footer");
+        assert!(answers.is_breaking_change);
+        assert_eq!(
+            answers.breaking_change_text,
+            Some("Removed Python 2 support".into())
+        );
+        assert_eq!(answers.issue_footer, None);
     }
 }

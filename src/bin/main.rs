@@ -1,4 +1,3 @@
-use std::fs::read_to_string;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
@@ -6,11 +5,12 @@ use clap::{CommandFactory, Parser, Subcommand};
 use cocogitto::command::commit::CommitOptions;
 use conventional_commit_parser::parse;
 use koji::answers::{get_extracted_answers, ExtractedAnswers};
-use koji::commit::{commit, generate_commit_msg, write_commit_msg};
+use koji::commit::{commit, generate_commit_msg};
 use koji::config::{Config, ConfigArgs};
-use koji::questions::{create_prompt, prompt_confirm};
+use koji::questions::{create_prompt, prompt_confirm, PreviousAnswers};
 use koji::scope::{detect_scope_matches, stage_tracked_changes};
-use koji::status::{check_staging, StagingStatus};
+use koji::status::StagingStatus;
+use koji::vcs::VcsBackend;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -122,8 +122,6 @@ enum SubCmds {
 
 #[cfg(not(tarpaulin_include))]
 fn main() -> Result<()> {
-    // Get CLI args
-
     let Args {
         command,
         autocomplete,
@@ -154,14 +152,46 @@ fn main() -> Result<()> {
         None => std::env::current_dir()?,
     };
 
-    // Find repo
-    let repo = gix::discover(&current_dir).context("could not find git repository")?;
+    let config = Config::new(Some(ConfigArgs {
+        autocomplete,
+        breaking_changes,
+        emoji,
+        issues,
+        path: config,
+        sign,
+        _user_config_path: None,
+        _current_dir: Some(current_dir.clone()),
+        ..Default::default()
+    }))?;
 
-    // Get existing commit message (passed in via `-m`)
-    let commit_editmsg = repo.path().join("COMMIT_EDITMSG");
-    let commit_message = match read_to_string(commit_editmsg) {
-        Ok(contents) => contents.lines().next().unwrap_or("").to_string(),
-        Err(_) => "".to_string(),
+    let backend = VcsBackend::detect_with_hint(&current_dir, config.vcs)
+        .context("could not find a supported repository (git or jj)")?;
+
+    if hook && !backend.supports_hooks() {
+        anyhow::bail!("--hook mode is not supported with jj repositories (jj has no commit hooks)");
+    }
+
+    let commit_message = if hook {
+        backend
+            .read_current_description()?
+            .map(|c| c.lines().next().unwrap_or("").to_string())
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+
+    // For jj, parse the existing description to pre-populate prompts
+    let previous_answers = if !hook && backend.is_jj() {
+        backend
+            .read_current_description()?
+            .and_then(|desc| PreviousAnswers::from_description(&desc))
+    } else if hook {
+        Some(PreviousAnswers {
+            summary: Some(commit_message.clone()),
+            ..Default::default()
+        })
+    } else {
+        None
     };
 
     if hook && parse(&commit_message).is_ok() {
@@ -170,7 +200,7 @@ fn main() -> Result<()> {
 
     // --hook and --stdout don't create commits; --all stages tracked files automatically
     if !hook && !stdout && !all {
-        match check_staging(&repo)? {
+        match backend.check_staging()? {
             StagingStatus::Empty => {
                 anyhow::bail!("no files staged for commit");
             }
@@ -184,31 +214,18 @@ fn main() -> Result<()> {
         }
     }
 
-    // Load config
-    let config = Config::new(Some(ConfigArgs {
-        autocomplete,
-        breaking_changes,
-        emoji,
-        issues,
-        path: config,
-        sign,
-        _user_config_path: None,
-        _current_dir: Some(current_dir.clone()),
-        ..Default::default()
-    }))?;
+    let scope_matches = match &backend {
+        VcsBackend::Git { repo } => {
+            if all {
+                stage_tracked_changes(repo).context("failed to pre-stage tracked files")?;
+            }
+            detect_scope_matches(repo, &config)?
+        }
+        #[cfg(feature = "jj")]
+        VcsBackend::Jj { .. } => Default::default(),
+    };
 
-    // When --all is set, stage tracked changes before anything else, so scope detection sees the ENTIRE diff.
-    // Afterwards, the commit step will re-stage idempotently.
-    if all {
-        stage_tracked_changes(&repo).context("failed to pre-stage tracked files")?;
-    }
-
-    let scope_matches = detect_scope_matches(&repo, &config)?;
-
-    // Get answers from interactive prompt
-    let answers = create_prompt(commit_message, &config, &scope_matches)?;
-
-    // Get data necessary for a conventional commit
+    let answers = create_prompt(previous_answers, &config, &scope_matches)?;
     let ExtractedAnswers {
         body,
         commit_type,
@@ -217,7 +234,6 @@ fn main() -> Result<()> {
         summary,
     } = get_extracted_answers(answers, config.emoji, &config.commit_types)?;
 
-    // Generate the commit message
     let message = generate_commit_msg(
         commit_type.clone(),
         scope.clone(),
@@ -226,27 +242,24 @@ fn main() -> Result<()> {
         is_breaking_change,
     )?;
 
-    // Print the commit message preview
     if stdout {
         println!("{message}");
     } else {
         eprintln!("\n{message}\n");
     }
 
-    // --stdout just prints the message without committing
     if stdout {
         return Ok(());
     }
 
-    // Prompt for confirmation unless --yes is set
     if !yes && !prompt_confirm()? {
         eprintln!("Commit aborted.");
         return Ok(());
     }
 
     // Do the thing!
-    if hook {
-        write_commit_msg(&repo, commit_type, scope, summary, body, is_breaking_change)?;
+    if hook || backend.is_jj() {
+        backend.write_commit_msg(commit_type, scope, summary, body, is_breaking_change)?;
     } else {
         let options = CommitOptions {
             commit_type: commit_type.as_str(),

@@ -6,6 +6,9 @@ sign = false
 force_config_scopes = false
 allow_empty_scope = true
 
+# "auto", "git", or "jj"
+vcs = "auto"
+
 [[commit_types]]
 name = "feat"
 emoji = "✨"

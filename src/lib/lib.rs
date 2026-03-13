@@ -5,3 +5,4 @@ pub mod emoji;
 pub mod questions;
 pub mod scope;
 pub mod status;
+pub mod vcs;

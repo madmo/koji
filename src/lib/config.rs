@@ -9,6 +9,14 @@ use std::path::PathBuf;
 #[cfg(any(unix, target_os = "redox"))]
 use xdg::BaseDirectories;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VcsPreference {
+    Auto,
+    Git,
+    Jj,
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub autocomplete: bool,
@@ -21,6 +29,7 @@ pub struct Config {
     pub force_config_scopes: bool,
     pub allow_empty_scope: bool,
     pub workdir: PathBuf,
+    pub vcs: Option<VcsPreference>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -91,6 +100,7 @@ struct ConfigTOML {
     pub sign: bool,
     pub force_config_scopes: bool,
     pub allow_empty_scope: bool,
+    pub vcs: Option<VcsPreference>,
 }
 
 #[derive(Default)]
@@ -108,7 +118,6 @@ pub struct ConfigArgs {
 }
 
 impl Config {
-    /// Find a config and load it
     pub fn new(args: Option<ConfigArgs>) -> Result<Self> {
         let ConfigArgs {
             path,
@@ -178,6 +187,7 @@ impl Config {
             force_config_scopes: force_scope.unwrap_or(config.force_config_scopes),
             allow_empty_scope: allow_empty_scope.unwrap_or(config.allow_empty_scope),
             workdir,
+            vcs: config.vcs,
         };
 
         config.validate_scope_patterns()?;
