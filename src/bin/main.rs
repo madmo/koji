@@ -164,8 +164,7 @@ fn main() -> Result<()> {
         ..Default::default()
     }))?;
 
-    let backend = VcsBackend::detect_with_hint(&current_dir, config.vcs)
-        .context("could not find a supported repository (git or jj)")?;
+    let backend = VcsBackend::detect_with_hint(&current_dir, config.vcs)?;
 
     if hook && !backend.supports_hooks() {
         anyhow::bail!("--hook mode is not supported with jj repositories (jj has no commit hooks)");
