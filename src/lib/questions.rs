@@ -133,9 +133,11 @@ fn format_commit_type_choice(
 }
 
 fn validate_summary(input: &str) -> Result<Validation, CustomUserError> {
-    match input.trim().is_empty() {
+    match input.trim().is_empty() || input.len() > 50 {
         false => Ok(Validation::Valid),
-        true => Ok(Validation::Invalid("A summary is required".into())),
+        true => Ok(Validation::Invalid(
+            "A summary is required and it should be <= 50 chars".into(),
+        )),
     }
 }
 
@@ -416,7 +418,7 @@ fn prompt_body(previous_body: Option<&str>) -> Result<Option<String>> {
         .map_err(|e| PromptError::from_inquire(e, "Body input"))?
     {
         Some(summary) if summary.is_empty() => Ok(None),
-        Some(summary) => Ok(Some(summary.replace("\\n", "\n"))),
+        Some(summary) => Ok(Some(textwrap::fill(&summary.replace("\\n", "\n"), 72))),
         None => Ok(None),
     }
 }
@@ -619,7 +621,17 @@ mod tests {
         assert!(validated.is_ok());
         assert!(validated
             .expect("Summary should be OK")
-            .eq(&Validation::Invalid("A summary is required".into())));
+            .eq(&Validation::Invalid(
+                "A summary is required and it should be <= 50 chars".into()
+            )));
+        assert_eq!(
+            validate_summary(&"a".repeat(50)).unwrap(),
+            Validation::Valid
+        );
+        assert!(matches!(
+            validate_summary(&"a".repeat(51)).unwrap(),
+            Validation::Invalid(_)
+        ));
     }
 
     #[test]

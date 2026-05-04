@@ -829,6 +829,7 @@ fn test_scope_autocompletion() -> Result<(), Box<dyn Error>> {
         sign: false,
         force_config_scopes: false,
         allow_empty_scope: true,
+        vcs: None,
     };
 
     let mut autocompleter = ScopeAutocompleter { config };
@@ -1286,7 +1287,8 @@ mod jj_tests {
     #[test]
     fn test_jj_commit_leaves_unrelated_git_repository_untouched() -> Result<(), Box<dyn Error>> {
         let (_, temp_dir, git_repo) = setup_test_dir()?;
-        let git_head = do_initial_commit(&git_repo, "unrelated Git commit")?;
+        do_initial_commit(&git_repo, "unrelated Git commit")?;
+        let git_head = git_repo.head()?.target();
         create_jj_repo(temp_dir.path());
         fs::write(temp_dir.path().join("README.md"), "hello\n")?;
         let mut index = git_repo.index()?;
@@ -1297,7 +1299,7 @@ mod jj_tests {
         let backend = koji::vcs::VcsBackend::detect_with_hint(temp_dir.path(), None)?;
         backend.write_commit_msg("feat".into(), None, "add readme".into(), None, false)?;
 
-        assert_eq!(git_repo.head()?.target(), Some(git_head));
+        assert_eq!(git_repo.head()?.target(), git_head);
         assert_eq!(git_repo.index()?.write_tree()?, git_tree);
         assert_eq!(
             fs::read_to_string(temp_dir.path().join("README.md"))?,
@@ -1609,8 +1611,8 @@ mod jj_tests {
         process.flush()?;
         let eof_output = process.exp_eof();
 
-        let exitcode = process.process.wait()?;
-        let success = matches!(exitcode, wait::WaitStatus::Exited(_, 0));
+        let exitcode = process.process().wait()?;
+        let success = matches!(exitcode, WaitStatus::Exited(_, 0));
 
         if !success {
             panic!("Command exited non-zero, end of output: {eof_output:#?}");
@@ -1681,8 +1683,8 @@ mod jj_tests {
         process.flush()?;
         let eof_output = process.exp_eof();
 
-        let exitcode = process.process.wait()?;
-        let success = matches!(exitcode, wait::WaitStatus::Exited(_, 0));
+        let exitcode = process.process().wait()?;
+        let success = matches!(exitcode, WaitStatus::Exited(_, 0));
 
         if !success {
             panic!("Command exited non-zero, end of output: {eof_output:#?}");
@@ -1752,8 +1754,8 @@ mod jj_tests {
 
         let eof_output = process.exp_eof();
 
-        let exitcode = process.process.wait()?;
-        let success = matches!(exitcode, wait::WaitStatus::Exited(_, 0));
+        let exitcode = process.process().wait()?;
+        let success = matches!(exitcode, WaitStatus::Exited(_, 0));
 
         if !success {
             panic!("Command exited non-zero, end of output: {eof_output:#?}");
@@ -1767,6 +1769,64 @@ mod jj_tests {
 
         temp_dir.close()?;
         config_temp_dir.close()?;
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn test_jj_configured_scope_pre_population_and_body_wrapping() -> Result<(), Box<dyn Error>> {
+        let bin_path = assert_cmd::cargo::cargo_bin!("koji").to_path_buf();
+        let temp_dir = tempfile::tempdir()?;
+        let config_temp_dir = setup_config_home()?;
+        create_jj_repo(temp_dir.path());
+        fs::write(
+            temp_dir.path().join(".koji.toml"),
+            r#"
+force_config_scopes = true
+breaking_changes = false
+issues = false
+[[commit_scopes]]
+name = "api"
+[[commit_scopes]]
+name = "readme"
+description = "Documentation"
+"#,
+        )?;
+        let first_line = "word ".repeat(14).trim_end().to_string();
+        let body = format!("{first_line} another word");
+        jj_describe(
+            temp_dir.path(),
+            &format!("docs(readme): update guide\n\n{body}"),
+        );
+
+        let mut cmd = Command::new(bin_path);
+        cmd.env("NO_COLOR", "1")
+            .arg("-C")
+            .arg(temp_dir.path())
+            .arg("--stdout");
+        let mut process = spawn_command(cmd, Some(10000))?;
+        process.expect_commit_type()?;
+        process.send_line("")?;
+        process.expect_scope()?;
+        process.send_line("")?;
+        process.expect_summary()?;
+        process.send_line("")?;
+        process.expect_body()?;
+        process.send_line("")?;
+        process.exp_string("docs(readme): update guide")?;
+        process.exp_string(&first_line)?;
+        process.exp_regex("\r?\nanother word")?;
+        process.exp_eof()?;
+        assert!(matches!(
+            process.process().wait()?,
+            WaitStatus::Exited(_, 0)
+        ));
+        assert_eq!(
+            jj_get_description(temp_dir.path()).trim(),
+            format!("docs(readme): update guide\n\n{body}")
+        );
+        config_temp_dir.close()?;
+        temp_dir.close()?;
         Ok(())
     }
 
@@ -1829,8 +1889,8 @@ mod jj_tests {
 
         let eof_output = process.exp_eof();
 
-        let exitcode = process.process.wait()?;
-        let success = matches!(exitcode, wait::WaitStatus::Exited(_, 0));
+        let exitcode = process.process().wait()?;
+        let success = matches!(exitcode, WaitStatus::Exited(_, 0));
 
         if !success {
             panic!("Command exited non-zero, end of output: {eof_output:#?}");

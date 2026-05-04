@@ -299,6 +299,7 @@ mod tests {
             sign: false,
             force_config_scopes: false,
             allow_empty_scope: true,
+            vcs: None,
             workdir,
         }
     }
