@@ -1229,6 +1229,69 @@ mod jj_tests {
     // ---- Non-interactive tests ----
 
     #[test]
+    #[ignore = "requires an installed jj CLI; run with --ignored --nocapture"]
+    fn test_jj_commit_with_installed_cli() -> Result<(), Box<dyn Error>> {
+        fn jj(dir: &Path, args: &[&str]) -> String {
+            let output = Command::new("jj")
+                .current_dir(dir)
+                .args(["--no-pager", "--config=ui.color=never"])
+                .args(args)
+                .output()
+                .expect("could not run installed jj CLI");
+            assert!(
+                output.status.success(),
+                "jj {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).expect("jj output was not UTF-8")
+        }
+
+        let temp_dir = tempfile::tempdir()?;
+        println!("{}", jj(temp_dir.path(), &["--version"]));
+        for name in ["reference", "koji"] {
+            let dir = temp_dir.path().join(name);
+            fs::create_dir(&dir)?;
+            jj(&dir, &["git", "init"]);
+            fs::write(dir.join("README.md"), "hello\n")?;
+            if name == "reference" {
+                jj(&dir, &["commit", "-m", "feat(core): add readme"]);
+            } else {
+                let backend = koji::vcs::VcsBackend::detect_with_hint(&dir, None)?;
+                backend.write_commit_msg(
+                    "feat".into(),
+                    Some("core".into()),
+                    "add readme".into(),
+                    None,
+                    false,
+                )?;
+            }
+            println!("{name}:\n{}", jj(&dir, &["log", "-r", "ancestors(@, 3)"]));
+            assert_eq!(
+                jj(
+                    &dir,
+                    &[
+                        "log",
+                        "--no-graph",
+                        "-r",
+                        "@",
+                        "-T",
+                        r#"description ++ "|" ++ parents.map(|p| p.description()).join(",")"#,
+                    ],
+                )
+                .trim(),
+                "|feat(core): add readme"
+            );
+            assert_eq!(
+                jj(&dir, &["file", "show", "-r", "@-", "README.md"]),
+                "hello\n"
+            );
+            assert_eq!(fs::read_to_string(dir.join("README.md"))?, "hello\n");
+            assert!(jj(&dir, &["diff", "--summary"]).is_empty());
+        }
+        Ok(())
+    }
+
+    #[test]
     fn test_jj_repo_detection() -> Result<(), Box<dyn Error>> {
         let bin_path = assert_cmd::cargo::cargo_bin!("koji").to_path_buf();
         let temp_dir = tempfile::tempdir()?;
@@ -1320,7 +1383,7 @@ mod jj_tests {
 
     #[test]
     #[cfg(not(target_os = "windows"))]
-    fn test_jj_describe() -> Result<(), Box<dyn Error>> {
+    fn test_jj_commit() -> Result<(), Box<dyn Error>> {
         let bin_path = assert_cmd::cargo::cargo_bin!("koji").to_path_buf();
         let temp_dir = tempfile::tempdir()?;
         let config_temp_dir = setup_config_home()?;
@@ -1365,10 +1428,22 @@ mod jj_tests {
             panic!("Command exited non-zero, end of output: {eof_output:#?}");
         }
 
-        let description = jj_get_description(temp_dir.path());
+        let (repo, workspace_name) = jj_load_repo(temp_dir.path());
+        let working_copy = jj_wc_commit(&repo, &workspace_name);
+        assert!(working_copy.description().is_empty());
+        assert_eq!(working_copy.parent_ids().len(), 1);
+        let parent = repo.store().get_commit(&working_copy.parent_ids()[0])?;
+        assert_ne!(working_copy.change_id(), parent.change_id());
+        assert_eq!(working_copy.tree_ids(), parent.tree_ids());
+        assert_ne!(parent.tree_ids(), &repo.store().empty_merged_tree_id());
+        assert_eq!(
+            fs::read_to_string(temp_dir.path().join("README.md"))?,
+            "hello"
+        );
+        let description = parent.description().trim();
         assert_eq!(
             description, "feat(core): add readme",
-            "jj describe did not set the expected commit message"
+            "jj commit did not describe the parent of the new working-copy change"
         );
 
         temp_dir.close()?;
@@ -1378,7 +1453,7 @@ mod jj_tests {
 
     #[test]
     #[cfg(not(target_os = "windows"))]
-    fn test_jj_describe_in_non_default_workspace() -> Result<(), Box<dyn Error>> {
+    fn test_jj_commit_in_non_default_workspace() -> Result<(), Box<dyn Error>> {
         let bin_path = assert_cmd::cargo::cargo_bin!("koji").to_path_buf();
         let temp_dir = tempfile::tempdir()?;
         let config_temp_dir = setup_config_home()?;
@@ -1425,10 +1500,18 @@ mod jj_tests {
             panic!("Command exited non-zero, end of output: {eof_output:#?}");
         }
 
-        let description = jj_get_description(&second_workspace_path);
+        let (repo, workspace_name) = jj_load_repo(&second_workspace_path);
+        let working_copy = jj_wc_commit(&repo, &workspace_name);
+        assert!(working_copy.description().is_empty());
+        assert_eq!(working_copy.parent_ids().len(), 1);
+        let parent = repo.store().get_commit(&working_copy.parent_ids()[0])?;
+        assert_eq!(working_copy.tree_ids(), parent.tree_ids());
+        assert_ne!(parent.tree_ids(), &repo.store().empty_merged_tree_id());
+        assert!(jj_get_description(temp_dir.path()).is_empty());
+        let description = parent.description().trim();
         assert_eq!(
             description, "feat(workspace): describe from non-default workspace",
-            "jj describe did not set the expected commit message in non-default workspace"
+            "jj commit did not describe the parent in non-default workspace"
         );
 
         temp_dir.close()?;

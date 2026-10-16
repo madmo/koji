@@ -143,7 +143,8 @@ impl VcsBackend {
         )
     }
 
-    /// For git, writes to `COMMIT_EDITMSG`. For jj, describes the current change via jj-lib.
+    /// For git, writes to `COMMIT_EDITMSG`. For jj, commits the current change
+    /// and starts a new working-copy change on top.
     pub fn write_commit_msg(
         &self,
         commit_type: String,
@@ -167,7 +168,7 @@ impl VcsBackend {
                 std::io::Write::write_all(&mut file, message.as_bytes())?;
                 Ok(())
             },
-            Jj { workspace_root } => Self::jj_write_description(workspace_root, &message),
+            Jj { workspace_root } => Self::jj_commit(workspace_root, &message),
         )
     }
 
@@ -413,16 +414,10 @@ impl VcsBackend {
     }
 
     #[cfg(feature = "jj")]
-    fn jj_load_repo(
-        workspace_root: &Path,
-    ) -> Result<(
-        std::sync::Arc<jj_lib::repo::ReadonlyRepo>,
-        jj_lib::ref_name::WorkspaceNameBuf,
-    )> {
+    fn jj_load_workspace(workspace_root: &Path) -> Result<jj_lib::workspace::Workspace> {
         use jj_lib::repo::StoreFactories;
         use jj_lib::settings::UserSettings;
         use jj_lib::workspace::{default_working_copy_factories, Workspace};
-        use pollster::FutureExt as _;
 
         let config = Self::jj_load_config(workspace_root)?;
         let settings =
@@ -430,8 +425,20 @@ impl VcsBackend {
         let store_factories = StoreFactories::default();
         let wc_factories = default_working_copy_factories();
 
-        let workspace = Workspace::load(&settings, workspace_root, &store_factories, &wc_factories)
-            .context("could not load jj workspace")?;
+        Workspace::load(&settings, workspace_root, &store_factories, &wc_factories)
+            .context("could not load jj workspace")
+    }
+
+    #[cfg(feature = "jj")]
+    fn jj_load_repo(
+        workspace_root: &Path,
+    ) -> Result<(
+        std::sync::Arc<jj_lib::repo::ReadonlyRepo>,
+        jj_lib::ref_name::WorkspaceNameBuf,
+    )> {
+        use pollster::FutureExt as _;
+
+        let workspace = Self::jj_load_workspace(workspace_root)?;
         let workspace_name = workspace.workspace_name().to_owned();
 
         let repo = workspace
@@ -476,15 +483,45 @@ impl VcsBackend {
     }
 
     #[cfg(feature = "jj")]
-    fn jj_write_description(workspace_root: &Path, message: &str) -> Result<()> {
+    fn jj_commit(workspace_root: &Path, message: &str) -> Result<()> {
+        use jj_lib::gitignore::GitIgnoreFile;
+        use jj_lib::matchers::{EverythingMatcher, NothingMatcher};
+        use jj_lib::working_copy::{SnapshotOptions, WorkingCopyFreshness};
         use pollster::FutureExt as _;
 
-        let (repo, workspace_name) = Self::jj_load_repo(workspace_root)?;
+        let mut workspace = Self::jj_load_workspace(workspace_root)?;
+        let workspace_name = workspace.workspace_name().to_owned();
+        let repo = workspace
+            .repo_loader()
+            .load_at_head()
+            .block_on()
+            .context("could not load jj repo at head")?;
         let commit = Self::jj_wc_commit(&repo, &workspace_name)?;
+        let mut locked_workspace = workspace
+            .start_working_copy_mutation()
+            .context("could not lock jj working copy")?;
+        anyhow::ensure!(
+            WorkingCopyFreshness::check_stale(locked_workspace.locked_wc(), &commit, &repo)?
+                == WorkingCopyFreshness::Fresh,
+            "jj working copy is stale; run `jj status` and retry"
+        );
+        let (tree, _) = locked_workspace
+            .locked_wc()
+            .snapshot(&SnapshotOptions {
+                base_ignores: GitIgnoreFile::empty(),
+                progress: None,
+                start_tracking_matcher: &EverythingMatcher,
+                force_tracking_matcher: &NothingMatcher,
+                max_new_file_size: u64::MAX,
+            })
+            .block_on()
+            .context("could not snapshot jj working copy")?;
 
         let mut tx = repo.start_transaction();
-        tx.repo_mut()
+        let described_commit = tx
+            .repo_mut()
             .rewrite_commit(&commit)
+            .set_tree(tree)
             .set_description(message)
             .write()
             .block_on()
@@ -492,10 +529,24 @@ impl VcsBackend {
         tx.repo_mut()
             .rebase_descendants()
             .block_on()
-            .context("could not rebase descendants after jj describe")?;
-        tx.commit("koji: describe change")
+            .context("could not rebase descendants after jj commit")?;
+        let new_commit = tx
+            .repo_mut()
+            .check_out(workspace_name, &described_commit)
+            .block_on()
+            .context("could not create new jj working-copy change")?;
+        locked_workspace
+            .locked_wc()
+            .check_out(&new_commit)
+            .block_on()
+            .context("could not update jj working copy")?;
+        let repo = tx
+            .commit("koji: commit change")
             .block_on()
             .context("could not commit jj transaction")?;
+        locked_workspace
+            .finish(repo.op_id().clone())
+            .context("could not save jj working-copy state")?;
 
         Ok(())
     }

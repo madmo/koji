@@ -132,13 +132,14 @@ koji altogether.
 ## Using with jj
 
 koji has optional support for [jj (Jujutsu)](https://martinvonz.github.io/jj/) repositories.
-When built with the `jj` feature, koji can describe the working-copy change directly
-instead of creating a git commit.
+When built with the `jj` feature, koji can commit the working-copy change directly,
+like `jj commit`, instead of creating a git commit.
 
 ### How it works
 
 - koji auto-detects whether you're in a jj or git repository
-- Running `koji` in a jj repo updates the working-copy change's description
+- Running `koji` in a jj repo describes the working-copy change and creates a new
+  empty working-copy change on top of it, like `jj commit`
 - If the working copy already has a conventional commit description, the prompts
   are pre-filled so you can edit rather than start from scratch
 - The `--hook` flag is not supported with jj (jj does not have commit hooks)
