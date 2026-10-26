@@ -120,7 +120,7 @@ pub fn stage_tracked_changes(repo: &Repository) -> Result<()> {
     let (entries, backing) = index.entries_mut_and_pathbacking();
     for entry in entries.iter_mut() {
         let path = entry.path_in(backing);
-        let full_path = workdir.join(gix::path::from_bstr(path));
+        let full_path = workdir.join(gix::path::from_bstr(path)?);
 
         match gix::index::fs::Metadata::from_path_no_follow(&full_path) {
             Err(_) => {
@@ -220,7 +220,7 @@ fn staged_changes(repo: &Repository) -> Result<Vec<StagedChange>> {
                 }
             }
 
-            Ok::<_, std::convert::Infallible>(gix::diff::index::Action::Continue(()))
+            Ok(gix::diff::index::Action::Continue(()))
         },
     )
     .context("could not diff HEAD tree against index")?;

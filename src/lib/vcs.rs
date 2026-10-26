@@ -1,4 +1,3 @@
-use std::convert::Infallible;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -225,7 +224,7 @@ impl VcsBackend {
                     gix::status::tree_index::TrackRenames::Disabled,
                     |_, _, _| {
                         staged_count += 1;
-                        Ok::<_, Infallible>(gix::diff::index::Action::Continue(()))
+                        Ok(gix::diff::index::Action::Continue(()))
                     },
                 )
                 .context("could not diff HEAD tree against index")?;
