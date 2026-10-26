@@ -1110,23 +1110,26 @@ mod jj_tests {
     use std::path::Path;
 
     use jj_lib::config::StackedConfig;
-    use jj_lib::repo::{ReadonlyRepo, Repo as _, StoreFactories};
-    use jj_lib::settings::UserSettings;
-    use jj_lib::workspace::{
-        default_working_copy_factories, default_working_copy_factory, Workspace,
+    use jj_lib::default_backend_factories::{
+        default_backend_factories, default_working_copy_factories, default_working_copy_factory,
     };
+    use jj_lib::object_id::ObjectId as _;
+    use jj_lib::repo::{ReadonlyRepo, Repo as _};
+    use jj_lib::settings::UserSettings;
+    use jj_lib::workspace::Workspace;
     use pollster::FutureExt as _;
     use std::sync::Arc;
 
     fn jj_settings() -> UserSettings {
         let config = StackedConfig::with_defaults();
-        UserSettings::from_config(config).expect("could not create jj UserSettings")
+        UserSettings::from_config_and_home_dir(config, None)
+            .expect("could not create jj UserSettings")
     }
 
     /// Create a non-colocated jj repo in the given directory.
     fn create_jj_repo(dir: &Path) {
         let settings = jj_settings();
-        Workspace::init_internal_git(&settings, dir)
+        Workspace::init_internal_git(&settings, dir, Default::default())
             .block_on()
             .expect("failed to init non-colocated jj repo");
     }
@@ -1134,7 +1137,7 @@ mod jj_tests {
     /// Create a colocated jj repo (both `.jj/` and `.git/` exist).
     fn create_colocated_jj_repo(dir: &Path) {
         let settings = jj_settings();
-        Workspace::init_colocated_git(&settings, dir)
+        Workspace::init_colocated_git(&settings, dir, Default::default())
             .block_on()
             .expect("failed to init colocated jj repo");
     }
@@ -1143,7 +1146,7 @@ mod jj_tests {
         workspace_root: &Path,
     ) -> (Arc<ReadonlyRepo>, jj_lib::ref_name::WorkspaceNameBuf) {
         let settings = jj_settings();
-        let store_factories = StoreFactories::default();
+        let store_factories = default_backend_factories();
         let wc_factories = default_working_copy_factories();
         let workspace = Workspace::load(&settings, workspace_root, &store_factories, &wc_factories)
             .expect("could not load jj workspace");
@@ -1200,7 +1203,7 @@ mod jj_tests {
         std::fs::create_dir_all(new_workspace_root).expect("failed to create workspace directory");
 
         let settings = jj_settings();
-        let store_factories = StoreFactories::default();
+        let store_factories = default_backend_factories();
         let wc_factories = default_working_copy_factories();
         let existing_workspace = Workspace::load(
             &settings,
@@ -1229,6 +1232,171 @@ mod jj_tests {
     // ---- Non-interactive tests ----
 
     #[test]
+    fn test_jj_commit_preserves_workspace_git_heads() -> Result<(), Box<dyn Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let main_dir = temp_dir.path().join("main");
+        let secondary_dir = temp_dir.path().join("secondary");
+        fs::create_dir(&main_dir)?;
+        create_colocated_jj_repo(&main_dir);
+        fs::write(main_dir.join("README.md"), "initial\n")?;
+        let backend = koji::vcs::VcsBackend::detect_with_hint(&main_dir, None)?;
+        backend.write_commit_msg("feat".into(), None, "initial".into(), None, false)?;
+
+        let (repo, workspace_name) = jj_load_repo(&main_dir);
+        let working_copy = jj_wc_commit(&repo, &workspace_name);
+        let git_repo = Repository::open(&main_dir)?;
+        assert_eq!(
+            git_repo.head()?.target().unwrap().as_bytes(),
+            working_copy.parent_ids()[0].as_bytes()
+        );
+        assert_eq!(
+            git_repo.status_file(Path::new("README.md"))?,
+            git2::Status::CURRENT
+        );
+        assert_eq!(
+            repo.view().git_head(&workspace_name).as_normal(),
+            Some(&working_copy.parent_ids()[0])
+        );
+        let git_heads = repo.view().all_git_heads().clone();
+
+        create_jj_workspace(&main_dir, &secondary_dir, "secondary");
+        fs::write(secondary_dir.join("secondary.txt"), "secondary\n")?;
+        let backend = koji::vcs::VcsBackend::detect_with_hint(&secondary_dir, None)?;
+        backend.write_commit_msg("feat".into(), None, "secondary".into(), None, false)?;
+
+        let (repo, secondary_name) = jj_load_repo(&secondary_dir);
+        assert_eq!(repo.view().all_git_heads(), &git_heads);
+        assert_eq!(jj_wc_commit(&repo, &workspace_name).id(), working_copy.id());
+        let secondary = jj_wc_commit(&repo, &secondary_name);
+        assert!(secondary.description().is_empty());
+        assert_eq!(
+            repo.store()
+                .get_commit(&secondary.parent_ids()[0])?
+                .description()
+                .trim(),
+            "feat: secondary"
+        );
+        assert_eq!(
+            git_repo.head()?.target().unwrap().as_bytes(),
+            working_copy.parent_ids()[0].as_bytes()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_jj_commit_leaves_unrelated_git_repository_untouched() -> Result<(), Box<dyn Error>> {
+        let (_, temp_dir, git_repo) = setup_test_dir()?;
+        let git_head = do_initial_commit(&git_repo, "unrelated Git commit")?;
+        create_jj_repo(temp_dir.path());
+        fs::write(temp_dir.path().join("README.md"), "hello\n")?;
+        let mut index = git_repo.index()?;
+        index.add_path(Path::new("README.md"))?;
+        index.write()?;
+        let git_tree = index.write_tree()?;
+
+        let backend = koji::vcs::VcsBackend::detect_with_hint(temp_dir.path(), None)?;
+        backend.write_commit_msg("feat".into(), None, "add readme".into(), None, false)?;
+
+        assert_eq!(git_repo.head()?.target(), Some(git_head));
+        assert_eq!(git_repo.index()?.write_tree()?, git_tree);
+        assert_eq!(
+            fs::read_to_string(temp_dir.path().join("README.md"))?,
+            "hello\n"
+        );
+        let (repo, workspace_name) = jj_load_repo(temp_dir.path());
+        let working_copy = jj_wc_commit(&repo, &workspace_name);
+        assert_eq!(
+            repo.store()
+                .get_commit(&working_copy.parent_ids()[0])?
+                .description()
+                .trim(),
+            "feat: add readme"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_jj_commit_reports_invalid_colocation_metadata() -> Result<(), Box<dyn Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        create_jj_repo(temp_dir.path());
+        let (repo, workspace_name) = jj_load_repo(temp_dir.path());
+        let original = jj_wc_commit(&repo, &workspace_name);
+        Repository::init(temp_dir.path())?;
+        fs::write(temp_dir.path().join(".git/config"), "[invalid\n")?;
+
+        let backend = koji::vcs::VcsBackend::detect_with_hint(temp_dir.path(), None)?;
+        let err = backend
+            .write_commit_msg("feat".into(), None, "add readme".into(), None, false)
+            .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("could not determine whether jj workspace is colocated"));
+        let (repo, workspace_name) = jj_load_repo(temp_dir.path());
+        assert_eq!(jj_wc_commit(&repo, &workspace_name).id(), original.id());
+        Ok(())
+    }
+
+    #[test]
+    fn test_jj_commit_reports_git_import_export_lock_failure() -> Result<(), Box<dyn Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        create_colocated_jj_repo(temp_dir.path());
+        let (repo, workspace_name) = jj_load_repo(temp_dir.path());
+        let original = jj_wc_commit(&repo, &workspace_name);
+        fs::create_dir(temp_dir.path().join(".jj/repo/git_import_export.lock"))?;
+
+        let backend = koji::vcs::VcsBackend::detect_with_hint(temp_dir.path(), None)?;
+        let err = backend
+            .write_commit_msg("feat".into(), None, "add readme".into(), None, false)
+            .unwrap_err();
+
+        assert!(err.to_string().contains("could not lock Git import/export"));
+        let (repo, workspace_name) = jj_load_repo(temp_dir.path());
+        assert_eq!(jj_wc_commit(&repo, &workspace_name).id(), original.id());
+        Ok(())
+    }
+
+    #[test]
+    fn test_jj_commit_preserves_concurrently_updated_git_head() -> Result<(), Box<dyn Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        create_colocated_jj_repo(temp_dir.path());
+        fs::write(temp_dir.path().join("README.md"), "hello\n")?;
+        let backend = koji::vcs::VcsBackend::detect_with_hint(temp_dir.path(), None)?;
+        backend.write_commit_msg("feat".into(), None, "add readme".into(), None, false)?;
+
+        let git_repo = Repository::open(temp_dir.path())?;
+        git_repo.config()?.set_str("user.name", "test")?;
+        git_repo
+            .config()?
+            .set_str("user.email", "test@example.org")?;
+        let parent = git_repo.head()?.peel_to_commit()?;
+        let signature = git_repo.signature()?;
+        let concurrent_head = git_repo.commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            "concurrent Git commit",
+            &parent.tree()?,
+            &[&parent],
+        )?;
+
+        backend.write_commit_msg("feat".into(), None, "second change".into(), None, false)?;
+
+        assert_eq!(git_repo.head()?.target(), Some(concurrent_head));
+        let (repo, workspace_name) = jj_load_repo(temp_dir.path());
+        let working_copy = jj_wc_commit(&repo, &workspace_name);
+        assert!(working_copy.description().is_empty());
+        assert_eq!(
+            repo.store()
+                .get_commit(&working_copy.parent_ids()[0])?
+                .description()
+                .trim(),
+            "feat: second change"
+        );
+        Ok(())
+    }
+
+    #[test]
     #[ignore = "requires an installed jj CLI; run with --ignored --nocapture"]
     fn test_jj_commit_with_installed_cli() -> Result<(), Box<dyn Error>> {
         fn jj(dir: &Path, args: &[&str]) -> String {
@@ -1248,12 +1416,32 @@ mod jj_tests {
 
         let temp_dir = tempfile::tempdir()?;
         println!("{}", jj(temp_dir.path(), &["--version"]));
-        for name in ["reference", "koji"] {
+        for name in [
+            "reference",
+            "koji",
+            "reference-colocated",
+            "koji-colocated",
+            "reference-workspace",
+            "koji-workspace",
+        ] {
             let dir = temp_dir.path().join(name);
             fs::create_dir(&dir)?;
-            jj(&dir, &["git", "init"]);
+            if name.ends_with("-colocated") || name.ends_with("-workspace") {
+                jj(&dir, &["git", "init", "--colocate"]);
+            } else {
+                jj(&dir, &["git", "init"]);
+            }
+            fs::write(dir.join("README.md"), "initial\n")?;
+            jj(&dir, &["commit", "-m", "initial commit"]);
+            let dir = if name.ends_with("-workspace") {
+                let workspace_dir = dir.join("secondary");
+                jj(&dir, &["workspace", "add", "--colocate", "secondary"]);
+                workspace_dir
+            } else {
+                dir
+            };
             fs::write(dir.join("README.md"), "hello\n")?;
-            if name == "reference" {
+            if name.starts_with("reference") {
                 jj(&dir, &["commit", "-m", "feat(core): add readme"]);
             } else {
                 let backend = koji::vcs::VcsBackend::detect_with_hint(&dir, None)?;

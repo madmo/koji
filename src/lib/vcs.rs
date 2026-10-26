@@ -415,14 +415,16 @@ impl VcsBackend {
 
     #[cfg(feature = "jj")]
     fn jj_load_workspace(workspace_root: &Path) -> Result<jj_lib::workspace::Workspace> {
-        use jj_lib::repo::StoreFactories;
+        use jj_lib::default_backend_factories::{
+            default_backend_factories, default_working_copy_factories,
+        };
         use jj_lib::settings::UserSettings;
-        use jj_lib::workspace::{default_working_copy_factories, Workspace};
+        use jj_lib::workspace::Workspace;
 
         let config = Self::jj_load_config(workspace_root)?;
-        let settings =
-            UserSettings::from_config(config).context("could not create jj UserSettings")?;
-        let store_factories = StoreFactories::default();
+        let settings = UserSettings::from_config_and_home_dir(config, dirs::home_dir())
+            .context("could not create jj UserSettings")?;
+        let store_factories = default_backend_factories();
         let wc_factories = default_working_copy_factories();
 
         Workspace::load(&settings, workspace_root, &store_factories, &wc_factories)
@@ -484,13 +486,37 @@ impl VcsBackend {
 
     #[cfg(feature = "jj")]
     fn jj_commit(workspace_root: &Path, message: &str) -> Result<()> {
+        use jj_lib::git::{self, GitResetHeadError};
+        use jj_lib::git_backend::GitRepoAtWorkdirError;
         use jj_lib::gitignore::GitIgnoreFile;
+        use jj_lib::lock::FileLock;
         use jj_lib::matchers::{EverythingMatcher, NothingMatcher};
         use jj_lib::working_copy::{SnapshotOptions, WorkingCopyFreshness};
         use pollster::FutureExt as _;
 
         let mut workspace = Self::jj_load_workspace(workspace_root)?;
         let workspace_name = workspace.workspace_name().to_owned();
+        let colocated = if let Ok(backend) = git::get_git_backend(workspace.repo_loader().store()) {
+            match backend.open_git_repo_at_workdir(workspace.workspace_root()) {
+                Ok(_) => true,
+                Err(GitRepoAtWorkdirError::NotFound { .. })
+                | Err(GitRepoAtWorkdirError::Unrelated { .. }) => false,
+                Err(err @ GitRepoAtWorkdirError::Other(_)) => {
+                    return Err(err)
+                        .context("could not determine whether jj workspace is colocated");
+                }
+            }
+        } else {
+            false
+        };
+        let _git_import_export_lock = if colocated {
+            Some(
+                FileLock::lock(workspace.repo_path().join("git_import_export.lock"))
+                    .context("could not lock Git import/export")?,
+            )
+        } else {
+            None
+        };
         let repo = workspace
             .repo_loader()
             .load_at_head()
@@ -499,9 +525,11 @@ impl VcsBackend {
         let commit = Self::jj_wc_commit(&repo, &workspace_name)?;
         let mut locked_workspace = workspace
             .start_working_copy_mutation()
+            .block_on()
             .context("could not lock jj working copy")?;
         anyhow::ensure!(
-            WorkingCopyFreshness::check_stale(locked_workspace.locked_wc(), &commit, &repo)?
+            WorkingCopyFreshness::check_stale(locked_workspace.locked_wc(), &commit, &repo)
+                .block_on()?
                 == WorkingCopyFreshness::Fresh,
             "jj working copy is stale; run `jj status` and retry"
         );
@@ -532,7 +560,7 @@ impl VcsBackend {
             .context("could not rebase descendants after jj commit")?;
         let new_commit = tx
             .repo_mut()
-            .check_out(workspace_name, &described_commit)
+            .check_out(workspace_name.clone(), &described_commit)
             .block_on()
             .context("could not create new jj working-copy change")?;
         locked_workspace
@@ -540,12 +568,26 @@ impl VcsBackend {
             .check_out(&new_commit)
             .block_on()
             .context("could not update jj working copy")?;
+        if colocated {
+            match git::reset_head(tx.repo_mut(), &workspace_name, workspace_root, &new_commit)
+                .block_on()
+            {
+                Ok(()) => {}
+                Err(err @ GitResetHeadError::UpdateHeadRef(_)) => {
+                    eprintln!("Warning: {:#}", anyhow::Error::new(err));
+                }
+                Err(err) => {
+                    return Err(err).context("could not update colocated Git HEAD and index");
+                }
+            }
+        }
         let repo = tx
             .commit("koji: commit change")
             .block_on()
             .context("could not commit jj transaction")?;
         locked_workspace
             .finish(repo.op_id().clone())
+            .block_on()
             .context("could not save jj working-copy state")?;
 
         Ok(())
@@ -553,8 +595,10 @@ impl VcsBackend {
 
     #[cfg(feature = "jj")]
     fn jj_commit_scopes(workspace_root: &Path) -> Result<Vec<String>> {
+        use futures::StreamExt as _;
         use jj_lib::repo::Repo as _;
-        use jj_lib::revset::{ResolvedRevsetExpression, RevsetIteratorExt as _};
+        use jj_lib::revset::{ResolvedRevsetExpression, RevsetStreamExt as _};
+        use pollster::FutureExt as _;
 
         let (repo, workspace_name) = Self::jj_load_repo(workspace_root)?;
         let commit = Self::jj_wc_commit(&repo, &workspace_name)?;
@@ -567,11 +611,10 @@ impl VcsBackend {
 
         let mut scopes: Vec<String> = Vec::new();
 
-        for commit_result in revset.iter().commits(repo.store()) {
-            let ancestor = match commit_result {
-                Ok(c) => c,
-                Err(_) => break,
-            };
+        let commits = revset.stream().commits(repo.store());
+        let mut commits = std::pin::pin!(commits);
+        while let Some(commit_result) = commits.next().block_on() {
+            let ancestor = commit_result.context("could not read jj ancestor")?;
             let desc = ancestor.description().to_string();
             let first_line = desc.lines().next().unwrap_or("");
             if let Ok(parsed) = parse_summary(first_line) {

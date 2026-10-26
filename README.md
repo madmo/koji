@@ -140,6 +140,9 @@ like `jj commit`, instead of creating a git commit.
 - koji auto-detects whether you're in a jj or git repository
 - Running `koji` in a jj repo describes the working-copy change and creates a new
   empty working-copy change on top of it, like `jj commit`
+- In colocated repositories and workspaces, Git HEAD and the index stay in sync
+  with the new working-copy change, using jj's colocation detection and Git
+  import/export lock; concurrent Git HEAD updates produce a warning, like jj
 - If the working copy already has a conventional commit description, the prompts
   are pre-filled so you can edit rather than start from scratch
 - The `--hook` flag is not supported with jj (jj does not have commit hooks)
